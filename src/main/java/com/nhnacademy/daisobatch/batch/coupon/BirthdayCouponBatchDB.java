@@ -7,7 +7,6 @@ import com.nhnacademy.daisobatch.listener.JobFailureNotificationListener;
 import com.nhnacademy.daisobatch.listener.coupon.BirthdayChunkListener;
 import com.nhnacademy.daisobatch.listener.coupon.BirthdaySkipListener;
 import com.nhnacademy.daisobatch.repository.coupon.CouponPolicyJdbcRepository;
-import com.nhnacademy.daisobatch.repository.coupon.IssuedCouponJdbcRepository;
 import com.nhnacademy.daisobatch.type.CouponStatus;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -51,7 +50,6 @@ public class BirthdayCouponBatchDB {
     private final JobRepository jobRepository;
     private final PlatformTransactionManager transactionManager;
     private final DataSource dataSource;
-    private final IssuedCouponJdbcRepository issuedCouponJdbcRepository;
 
     // Processor에서 재사용할 쿠폰 쟁책 캐시
     private CouponPolicy birthdayPolicy;
@@ -126,13 +124,6 @@ public class BirthdayCouponBatchDB {
                     AND uc.coupon_policy_id = :policyId
               )
         """);
-
-//        queryProvider.setWhereClause("""
-//            WHERE u.birth IS NOT NULL
-//              AND MONTH(u.birth) = :month
-//              AND a.current_status_id = :statusId
-//              AND uc.user_coupon_id IS NULL
-//        """);
 
         Map<String, Order> sortKeys = new LinkedHashMap<>();
         sortKeys.put("u.user_created_id", Order.ASCENDING);

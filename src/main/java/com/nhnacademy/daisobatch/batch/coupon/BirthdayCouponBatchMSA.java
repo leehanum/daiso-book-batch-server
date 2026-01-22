@@ -18,7 +18,6 @@ import org.springframework.batch.core.configuration.annotation.StepScope;
 import org.springframework.batch.core.job.builder.JobBuilder;
 import org.springframework.batch.core.repository.JobRepository;
 import org.springframework.batch.core.step.builder.StepBuilder;
-import org.springframework.batch.item.ItemProcessor;
 import org.springframework.batch.item.ItemReader;
 import org.springframework.batch.item.ItemWriter;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -42,7 +41,6 @@ public class BirthdayCouponBatchMSA {
 
     private final JobFailureNotificationListener jobFailureNotificationListener;
 
-
     @Value("${rabbitmq.birthday.exchange}")
     private String birthdayExchange;
 
@@ -62,13 +60,11 @@ public class BirthdayCouponBatchMSA {
     @Bean(name = "birthdayCouponStepMSA")
     public Step birthdayCouponStepMSA(
             @Qualifier("birthdayUserReaderMSA") ItemReader<BirthdayUserDto> reader,
-            @Qualifier("birthdayUserProcessorMSA") ItemProcessor<BirthdayUserDto, Long> processor,
-            @Qualifier("birthdayUserWriterMSA") ItemWriter<Long> writer
+            @Qualifier("birthdayUserWriterMSA") ItemWriter<BirthdayUserDto> writer
     ) {
         return new StepBuilder("birthdayCouponStepMSA", jobRepository)
-                .<BirthdayUserDto, Long>chunk(1000, transactionManager)
+                .<BirthdayUserDto, BirthdayUserDto>chunk(1000, transactionManager)
                 .reader(reader)
-                .processor(processor)
                 .writer(writer)
                 .build();
     }
@@ -85,12 +81,13 @@ public class BirthdayCouponBatchMSA {
             private final int size = 1000;
             private boolean finished = false;
 
+            private final int month = LocalDate.now().getMonthValue();
+
             @Override
             public BirthdayUserDto read() {
                 if (finished) return null; // 이미 끝났으면 null
 
                 if (users == null || index >= users.size()) {
-                    int month = LocalDate.now().getMonthValue();
                     log.info("User 서버에서 {}월 생일자 조회(커서) - lastSeenId={}, size={}",
                             month, lastSeenId, size);
                     users = fetchWithRetry(month, lastSeenId, size);
@@ -119,7 +116,7 @@ public class BirthdayCouponBatchMSA {
                         if (attempt == 3){
                             throw new UserServicePagingFailedException(
                                     "User 서버 생일자 커서 조회 실패 (Retryable) " +
-                                    "(month=" + month + ", lastSeenId=" + lastSeenId + ", size=" + size + ")", e);
+                                            "(month=" + month + ", lastSeenId=" + lastSeenId + ", size=" + size + ")", e);
                         }
                         log.warn("User 서버 커서 조회 재시도(Retryable) - attempt={}/3, month={}, lastSeenId={}",
                                 attempt, month, lastSeenId);
@@ -142,27 +139,24 @@ public class BirthdayCouponBatchMSA {
             }
 
             private void sleep() {
-                try { Thread.sleep(300); } catch (InterruptedException ignored) {}
+                try {
+                    Thread.sleep(300); } catch (InterruptedException ignored) {}
             }
         };
     }
 
-
-    // ===== 4) Processor (MSA): DTO -> userId =====
-    @Bean(name = "birthdayUserProcessorMSA")
-    @StepScope
-    public ItemProcessor<BirthdayUserDto, Long> birthdayUserProcessorMSA() {
-        return item -> item.getUserCreatedId();
-    }
-
-    // ===== 5) Writer (MSA): RabbitMQ publish =====
+    // ===== 4) Writer (MSA): RabbitMQ publish =====
     @Bean(name = "birthdayUserWriterMSA")
-    public ItemWriter<Long> birthdayUserWriterMSA() {
+    public ItemWriter<BirthdayUserDto> birthdayUserWriterMSA() {
         return chunk -> {
-            List<? extends Long> userIds = chunk.getItems();
+            List<Long> userIds = chunk.getItems().stream()
+                    .map(BirthdayUserDto::getUserCreatedId)
+                    .toList();
+
+            String batchKey = "birthday-" + LocalDate.now();
 
             BirthdayCouponBulkEvent event =
-                    new BirthdayCouponBulkEvent(List.copyOf(userIds), "birthday-" + LocalDate.now());
+                    new BirthdayCouponBulkEvent(userIds, batchKey);
 
             CorrelationData cd = new CorrelationData(event.batchId());
 
@@ -171,20 +165,13 @@ public class BirthdayCouponBatchMSA {
                 return message;
             }, cd);
 
-            // broker confirm 기다림
             CorrelationData.Confirm confirm = cd.getFuture().get(5, java.util.concurrent.TimeUnit.SECONDS);
-
             if (!confirm.isAck()) {
                 throw new RabbitPublishFailedException(
                         "Rabbit publish NACK.(메시지 큐 접근 실패) batchId=" + event.batchId() + ", cause=" + confirm.getReason()
                 );
             }
-            // (선택) returns는 아래 “ReturnsTracker” 방식으로 잡는 게 깔끔
-            // log.info("Bulk publish confirmed size={}, batchId={}", userIds.size(), event.batchId());
         };
     }
-
-
-
 
 }
