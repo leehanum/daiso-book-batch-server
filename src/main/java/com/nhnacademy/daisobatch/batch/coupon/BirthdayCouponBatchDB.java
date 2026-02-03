@@ -13,6 +13,7 @@ import java.time.LocalDateTime;
 import java.util.*;
 
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.batch.core.Job;
 import org.springframework.batch.core.Step;
 import org.springframework.batch.core.configuration.annotation.StepScope;
@@ -30,14 +31,17 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.task.TaskExecutor;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.dao.TransientDataAccessException;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.transaction.PlatformTransactionManager;
 
 import javax.sql.DataSource;
 
+@Slf4j
 @Configuration
 @RequiredArgsConstructor
 public class BirthdayCouponBatchDB {
@@ -51,72 +55,111 @@ public class BirthdayCouponBatchDB {
     private final PlatformTransactionManager transactionManager;
     private final DataSource dataSource;
 
-    // Processor에서 재사용할 쿠폰 쟁책 캐시
-    private CouponPolicy birthdayPolicy;
+    private final BirthdayUserIdRangePartitioner birthdayUserIdRangePartitioner;
 
     private final JobFailureNotificationListener jobFailureNotificationListener;
 
-    // 1. Job 정의
+    // Processor에서 재사용할 쿠폰 정책 캐시
+    // (파티셔닝 들어가면 여러 스레드에서 접근 가능 → 아래에서 안전하게 초기화) 동시성 고려
+    private volatile CouponPolicy birthdayPolicy;
+
+    // 0) TaskExecutor (스레드 풀)
+    @Bean(name = "birthdayTaskExecutor")
+    public TaskExecutor birthdayTaskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(4);
+        executor.setMaxPoolSize(8);
+        executor.setQueueCapacity(100);
+        executor.setThreadNamePrefix("birthday-partition-");
+        executor.initialize();
+        return executor;
+    }
+
+
+
+    // 1) Job: ManagerStep부터 시작
     @Bean(name = "birthdayCouponJobDB")
-    public Job birthdayCouponJobDB(@Qualifier("birthdayCouponStepDB") Step step) {
+    public Job birthdayCouponJobDB(@Qualifier("birthdayCouponManagerStepDB") Step managerStep) {
         return new JobBuilder("birthdayCouponJobDB", jobRepository)
-                .start(step)
+                .start(managerStep)
                 .listener(jobFailureNotificationListener)
                 .build();
     }
 
-    // 2. Step 정의
-    @Bean(name = "birthdayCouponStepDB")
-    public Step birthdayCouponStepDB(
-            @Qualifier("birthdayUserReaderDB") JdbcPagingItemReader<BirthdayUserDto> reader,
+    // 2) ManagerStep: 파티션 생성 + Worker 병렬 실행
+    @Bean(name = "birthdayCouponManagerStepDB")
+    public Step birthdayCouponManagerStepDB(
+            @Qualifier("birthdayCouponWorkerStepDB") Step workerStep,
+            @Qualifier("birthdayTaskExecutor") TaskExecutor taskExecutor // taskExecutor 멀티쓰래드
+    ) {
+        return new StepBuilder("birthdayCouponManagerStepDB", jobRepository)
+                .partitioner("birthdayCouponWorkerStepDB", birthdayUserIdRangePartitioner)
+                .step(workerStep)
+                .gridSize(4) // 파티션 개수(=동시 워커 수). 필요하면 yml에서 주입해도 됨
+                .taskExecutor(taskExecutor)
+                .build();
+    }
+
+    // 3) WorkerStep: 각 파티션이 수행할 Chunk Step
+    @Bean(name = "birthdayCouponWorkerStepDB")
+    public Step birthdayCouponWorkerStepDB(
+            @Qualifier("birthdayUserReaderPartitioned") JdbcPagingItemReader<BirthdayUserDto> reader,
             @Qualifier("birthdayUserProcessorDB") ItemProcessor<BirthdayUserDto, UserCoupon> processor,
             @Qualifier("birthdayUserJdbcWriterDB") JdbcBatchItemWriter<UserCoupon> writer
     ) {
-        return new StepBuilder("birthdayCouponStepDB", jobRepository)
+        return new StepBuilder("birthdayCouponWorkerStepDB", jobRepository)
                 .<BirthdayUserDto, UserCoupon>chunk(1000, transactionManager)
                 .reader(reader)
                 .processor(processor)
                 .writer(writer)
 
-                // 실패 처리 추가
                 .faultTolerant()
-                // 중복 발급(유니크 키) / 무결성 문제는 "데이터 문제"로 보고 스킵
-                .skip(DuplicateKeyException.class) // 이미 쿠폰이 있어 PK 충돌이 나면 Skip
-                .skip(IllegalArgumentException.class) // 로직상 데이터 문제 시 Skip
+                .skip(DuplicateKeyException.class)
+                .skip(IllegalArgumentException.class)
                 .skip(DataIntegrityViolationException.class)
                 .skipLimit(100)
 
-                // Retry 전략: DB 연결 문제나 데드락은 재시도
-                .retry(TransientDataAccessException.class) // 일시적 DB 오류
+                .retry(TransientDataAccessException.class)
                 .retryLimit(3)
 
-                .listener(birthdayChunkListener) // 생일 쿠폰 배치에서 chunk 단위로 성공/실패/진행 상황을 알려주는 로그 감시자
+                .listener(birthdayChunkListener)
                 .listener(birthdaySkipListener)
                 .build();
     }
 
-    // 3. Reader (DB 직접 조회 + 페이징)
-    @Bean(name = "birthdayUserReaderDB")
+    // 4) Reader: 파티션별 ID 범위 + 월 조건으로 조회
+    @Bean(name = "birthdayUserReaderPartitioned")
     @StepScope
-    public JdbcPagingItemReader<BirthdayUserDto> birthdayUserReaderDB(
-            @Value("#{jobParameters['currentMonth']}") Integer currentMonth
+    public JdbcPagingItemReader<BirthdayUserDto> birthdayUserReaderPartitioned(
+            @Value("#{stepExecutionContext['minUserCreatedId']}") Long minUserCreatedId,
+            @Value("#{stepExecutionContext['maxUserCreatedId']}") Long maxUserCreatedId,
+            @Value("#{stepExecutionContext['currentMonth']}") Integer currentMonth
     ) {
-        int month = (currentMonth != null)
-                ? currentMonth
-                : LocalDate.now().getMonthValue();
+        if (minUserCreatedId == null || maxUserCreatedId == null || currentMonth == null) {
+            throw new IllegalStateException(
+                    "Partition context missing. " +
+                            "minUserCreatedId=" + minUserCreatedId +
+                            ", maxUserCreatedId=" + maxUserCreatedId +
+                            ", currentMonth=" + currentMonth
+            );
+        }
+
+        log.info("[Reader] month={}, range={}~{}", currentMonth, minUserCreatedId, maxUserCreatedId);
 
         MySqlPagingQueryProvider queryProvider = new MySqlPagingQueryProvider();
-        queryProvider.setSelectClause("SELECT DISTINCT u.user_created_id AS user_created_id");
+        queryProvider.setSelectClause("SELECT u.user_created_id AS user_created_id");
 
         queryProvider.setFromClause("""
             FROM Users u
             INNER JOIN Accounts a
                 ON a.user_created_id = u.user_created_id
         """);
+
         queryProvider.setWhereClause("""
             WHERE u.birth IS NOT NULL
               AND MONTH(u.birth) = :month
               AND a.current_status_id = :statusId
+              AND u.user_created_id BETWEEN :minUserCreatedId AND :maxUserCreatedId
               AND NOT EXISTS (
                   SELECT 1
                   FROM user_coupons uc
@@ -130,30 +173,40 @@ public class BirthdayCouponBatchDB {
         queryProvider.setSortKeys(sortKeys);
 
         Map<String, Object> params = new HashMap<>();
-        params.put("month", month);
+        params.put("month", currentMonth);
         params.put("statusId", 1); // ACTIVE
         params.put("policyId", BIRTHDAY_POLICY_ID);
+        params.put("minUserCreatedId", minUserCreatedId);
+        params.put("maxUserCreatedId", maxUserCreatedId);
 
         return new JdbcPagingItemReaderBuilder<BirthdayUserDto>()
-                .name("birthdayUserReaderDB")
+                .name("birthdayUserReaderPartitioned")
                 .dataSource(dataSource)
                 .queryProvider(queryProvider)
                 .parameterValues(params)
                 .pageSize(5000)
                 .fetchSize(5000)
-                .rowMapper((rs, rowNum) ->
-                        new BirthdayUserDto(rs.getLong("user_created_id"))
-                )
+                .rowMapper((rs, rowNum) -> new BirthdayUserDto(rs.getLong("user_created_id")))
                 .build();
     }
 
-    // 4. Processor: DTO -> Entity 변환 (중복 발급 장지 + 정책 캐싱)
+    // 5) Processor: 정책 1회 로딩 + 엔티티 변환
     @Bean(name = "birthdayUserProcessorDB")
     @StepScope
     public ItemProcessor<BirthdayUserDto, UserCoupon> birthdayUserProcessorDB() {
-        if (birthdayPolicy == null) {
-            birthdayPolicy = couponPolicyJdbcRepository.findById(BIRTHDAY_POLICY_ID);
+
+        // 파티셔닝(멀티스레드) 대비: 정책 캐시를 한 번만 초기화
+        CouponPolicy policy = birthdayPolicy;
+        if (policy == null) {
+            synchronized (this) {
+                policy = birthdayPolicy;
+                if (policy == null) {
+                    birthdayPolicy = policy = couponPolicyJdbcRepository.findById(BIRTHDAY_POLICY_ID);
+                }
+            }
         }
+
+        final CouponPolicy finalPolicy = policy;
 
         return item -> {
             Long userId = item.getUserCreatedId();
@@ -163,7 +216,7 @@ public class BirthdayCouponBatchDB {
             LocalDateTime expiryAt = now.withDayOfMonth(now.lengthOfMonth()).atTime(23, 59, 59);
 
             return UserCoupon.builder()
-                    .couponPolicy(birthdayPolicy)
+                    .couponPolicy(finalPolicy)
                     .userId(userId)
                     .status(CouponStatus.ISSUED)
                     .issuedAt(issuedAt)
@@ -173,7 +226,7 @@ public class BirthdayCouponBatchDB {
         };
     }
 
-    // 5. Writer: DB에 저장 (null 제거 후 저장)
+    // 6) Writer: INSERT IGNORE로 중복 방지
     @Bean(name = "birthdayUserJdbcWriterDB")
     public JdbcBatchItemWriter<UserCoupon> birthdayUserJdbcWriterDB() {
         return new JdbcBatchItemWriterBuilder<UserCoupon>()
